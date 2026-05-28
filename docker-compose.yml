@@ -1,0 +1,34 @@
+version: "3.9"
+
+services:
+  spectre-relay:
+    build: .
+    container_name: spectre-relay
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    volumes:
+      # TLS material — read-only so a compromised process cannot rewrite it.
+      - ./certs:/certs:ro
+      # Encrypted offline queue + its key file. The queue file is at-rest
+      # encrypted; the key file lives here too but with mode 0600.
+      - ./data:/data
+    environment:
+      SPECTRE_LISTEN_ADDR: ":443"
+      SPECTRE_TLS_CERT: "/certs/server.crt"
+      SPECTRE_TLS_KEY: "/certs/server.key"
+      SPECTRE_MAX_CLIENTS: "10000"
+      SPECTRE_MESSAGE_TTL: "604800"
+      SPECTRE_MAX_MESSAGE_SIZE: "65536"
+      SPECTRE_RATE_LIMIT_PER_MIN: "60"
+      SPECTRE_QUEUE_PATH: "/data/offline_queue.enc"
+      SPECTRE_DEV: "false"
+    # Drop ALL kernel capabilities; the relay does not need any.
+    cap_drop:
+      - ALL
+    # No new privileges, read-only root FS — /data and /certs are the only writable mounts.
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
