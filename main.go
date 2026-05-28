@@ -15,7 +15,17 @@ import (
 func main() {
 	// JSON-structured logs to stdout. The slog handler is the ONLY log
 	// surface — any package that needs to emit info routes through here.
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	//
+	// SPECTRE_DEBUG=true lowers the handler floor to Debug so the
+	// temporary auth-handshake trace in server/auth.go actually reaches
+	// stdout. Same env var the Authenticator samples, so the two stay
+	// in lockstep — no scenario where dbg() fires but the handler drops
+	// the line, or vice versa.
+	level := slog.LevelInfo
+	if os.Getenv("SPECTRE_DEBUG") == "true" {
+		level = slog.LevelDebug
+	}
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 
 	cfg, err := config.Load()
 	if err != nil {

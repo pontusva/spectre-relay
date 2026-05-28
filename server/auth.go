@@ -6,7 +6,9 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -65,10 +67,35 @@ func (l *authLimiter) allow(ip string) bool {
 
 type Authenticator struct {
 	limiter *authLimiter
+	log     *slog.Logger
+	// debug gates the verbose handshake trace below. Sampled once at
+	// construction from SPECTRE_DEBUG so flipping the env var requires
+	// a process restart — we don't want a flag flip mid-flight to start
+	// emitting key lengths while a hostile observer is connected.
+	//
+	// TEMPORARY: this whole code path exists to diagnose a specific
+	// Dart/Go ed25519 wire mismatch. Remove it once relay-auth is green
+	// in CI; it has no business shipping in a production binary.
+	debug bool
 }
 
-func NewAuthenticator() *Authenticator {
-	return &Authenticator{limiter: newAuthLimiter()}
+func NewAuthenticator(log *slog.Logger) *Authenticator {
+	return &Authenticator{
+		limiter: newAuthLimiter(),
+		log:     log,
+		debug:   os.Getenv("SPECTRE_DEBUG") == "true",
+	}
+}
+
+// dbg emits a slog.Debug line only when SPECTRE_DEBUG=true was set at
+// process start. Callers pass key lengths and step names, NEVER the
+// raw key bytes, signature bytes, nonce, UserID, or remote IP — those
+// would defeat the no-PII guarantees the rest of the relay enforces.
+func (a *Authenticator) dbg(msg string, args ...any) {
+	if !a.debug || a.log == nil {
+		return
+	}
+	a.log.Debug(msg, args...)
 }
 
 // Authenticate runs the challenge/response handshake over an upgraded WebSocket.
@@ -84,6 +111,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, c *websocket.Conn, rem
 	if !a.limiter.allow(remoteIP) {
 		return "", ErrAuthFailed
 	}
+	a.dbg("auth: rate limit check passed")
 
 	// 32 bytes is well above ed25519's required input entropy and large
 	// enough to make collisions across the relay's lifetime negligible.
@@ -91,6 +119,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, c *websocket.Conn, rem
 	if _, err := rand.Read(nonce); err != nil {
 		return "", ErrAuthFailed
 	}
+	a.dbg("auth: nonce generated")
 
 	hsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -98,23 +127,44 @@ func (a *Authenticator) Authenticate(ctx context.Context, c *websocket.Conn, rem
 	if err := wsjson.Write(hsCtx, c, model.Challenge{Nonce: nonce}); err != nil {
 		return "", ErrAuthFailed
 	}
+	a.dbg("auth: challenge sent")
 
 	var req model.AuthRequest
 	if err := wsjson.Read(hsCtx, c, &req); err != nil {
 		return "", ErrAuthFailed
 	}
 
-	pub, err := base64.StdEncoding.DecodeString(req.IdentityPublicKey)
-	if err != nil || len(pub) != ed25519.PublicKeySize {
+	// Decode both fields before the structural checks below so the
+	// "request received" line can report the *decoded* lengths — that
+	// is what tells us whether the client base64'd the right thing.
+	// Decode errors are swallowed here on purpose: invalid base64 falls
+	// through to the length check, which fails closed and returns the
+	// same ErrAuthFailed as every other path.
+	pub, _ := base64.StdEncoding.DecodeString(req.IdentityPublicKey)
+	sig, _ := base64.StdEncoding.DecodeString(req.Signature)
+
+	a.dbg("auth: request received",
+		"user_id_len", len(req.UserID),
+		"pub_key_len", len(pub),
+		"sig_len", len(sig),
+	)
+
+	if len(pub) != ed25519.PublicKeySize {
 		return "", ErrAuthFailed
 	}
-	sig, err := base64.StdEncoding.DecodeString(req.Signature)
-	if err != nil || len(sig) != ed25519.SignatureSize {
+	a.dbg("auth: pub key decoded")
+
+	if len(sig) != ed25519.SignatureSize {
 		return "", ErrAuthFailed
 	}
+	a.dbg("auth: sig decoded")
+
 	if !ed25519.Verify(ed25519.PublicKey(pub), nonce, sig) {
+		a.dbg("auth: signature FAILED")
 		return "", ErrAuthFailed
 	}
+	a.dbg("auth: signature verified")
+
 	if req.UserID == "" {
 		return "", ErrAuthFailed
 	}
@@ -122,6 +172,18 @@ func (a *Authenticator) Authenticate(ctx context.Context, c *websocket.Conn, rem
 	// The only success response we ever send. No diagnostics included.
 	if err := wsjson.Write(hsCtx, c, model.AuthResponse{Success: true}); err != nil {
 		return "", ErrAuthFailed
+	}
+	// TODO: remove before production
+	// (Authenticator has its own logger; the user-facing spec referenced
+	//  `s.log`, but auth.go runs before serveConn assigns `s` — `a.log`
+	//  is the equivalent and is unconditional, unlike the SPECTRE_DEBUG-
+	//  gated a.dbg().)
+	if a.log != nil {
+		uidPrefix := req.UserID
+		if len(uidPrefix) > 8 {
+			uidPrefix = uidPrefix[:8]
+		}
+		a.log.Info("DEV auth success", "uid_prefix", uidPrefix)
 	}
 	return req.UserID, nil
 }

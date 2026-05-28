@@ -19,6 +19,7 @@ type Config struct {
 	MaxMessageSize    int
 	RateLimitPerMin   int
 	OfflineQueuePath  string
+	PrekeyStorePath   string
 	DevMode           bool
 }
 
@@ -36,7 +37,11 @@ func Load() (*Config, error) {
 		MaxMessageSize:    getEnvInt("SPECTRE_MAX_MESSAGE_SIZE", 65536),
 		RateLimitPerMin:   getEnvInt("SPECTRE_RATE_LIMIT_PER_MIN", 60),
 		OfflineQueuePath:  getEnv("SPECTRE_QUEUE_PATH", "/data/offline_queue.enc"),
-		DevMode:           os.Getenv("SPECTRE_DEV") == "true",
+		// Prekey-bundle store: separate file (and separate AES-256 key
+		// file at <path>.key) from the offline queue. A compromise of one
+		// data class does not grant the other — defense in depth.
+		PrekeyStorePath: getEnv("SPECTRE_PREKEY_PATH", "/data/prekeys.enc"),
+		DevMode:         os.Getenv("SPECTRE_DEV") == "true",
 	}
 
 	if !cfg.DevMode {
