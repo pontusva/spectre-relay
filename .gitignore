@@ -1,0 +1,16 @@
+# Built binary
+spectre-relay
+
+# Runtime data — never commit
+data/
+*.enc
+*.enc.key
+*.key
+
+# TLS material
+certs/
+*.pem
+*.crt
+
+# Dev
+*.log
