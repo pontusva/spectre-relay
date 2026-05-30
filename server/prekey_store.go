@@ -181,6 +181,23 @@ func (ps *PrekeyStore) getBundle(userID string) (*PrekeyResponse, bool) {
 // have the static bundle fields cached and only need a fresh OTPK.
 // Returns nil,false when no OTPK is available (or the user has never
 // registered) — caller must NOT distinguish those two states externally.
+//
+// identityKeyOf returns the base64 identity public key from userID's
+// registered bundle WITHOUT consuming a one-time prekey. Used by
+// sealed-sender certificate issuance to bind a cert's `ik` to the key the
+// user actually published — never to a key supplied in the request. Returns
+// false if the user has never registered a bundle (caller must then refuse
+// to issue a cert).
+func (ps *PrekeyStore) identityKeyOf(userID string) (string, bool) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	b, ok := ps.bundles[userID]
+	if !ok {
+		return "", false
+	}
+	return b.IdentityKey, true
+}
+
 func (ps *PrekeyStore) consumeOneTimePrekey(userID string) (*OneTimePrekey, bool) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()

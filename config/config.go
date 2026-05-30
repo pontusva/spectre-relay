@@ -20,6 +20,7 @@ type Config struct {
 	RateLimitPerMin   int
 	OfflineQueuePath  string
 	PrekeyStorePath   string
+	SealedCAPath      string
 	DevMode           bool
 }
 
@@ -41,7 +42,11 @@ func Load() (*Config, error) {
 		// file at <path>.key) from the offline queue. A compromise of one
 		// data class does not grant the other — defense in depth.
 		PrekeyStorePath: getEnv("SPECTRE_PREKEY_PATH", "/data/prekeys.enc"),
-		DevMode:         os.Getenv("SPECTRE_DEV") == "true",
+		// Sealed-sender certificate signing key. Separate file (raw 64-byte
+		// ed25519 private key, 0600) from the AES data keys — a leak of this
+		// key forges sender attribution but reads no content (see SealedCA).
+		SealedCAPath: getEnv("SPECTRE_SEALED_CA_PATH", "/data/sealed_ca.key"),
+		DevMode:      os.Getenv("SPECTRE_DEV") == "true",
 	}
 
 	if !cfg.DevMode {

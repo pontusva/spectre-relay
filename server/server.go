@@ -23,11 +23,12 @@ type Server struct {
 	cfg     *config.Config
 	store   *Store
 	prekeys *PrekeyStore
-	router  *Router
-	auth    *Authenticator
-	log     *slog.Logger
-	hs      *http.Server
-	active  int64
+	router   *Router
+	auth     *Authenticator
+	sealedCA *SealedCA
+	log      *slog.Logger
+	hs       *http.Server
+	active   int64
 }
 
 func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
@@ -39,14 +40,19 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	sealedCA, err := NewSealedCA(cfg.SealedCAPath)
+	if err != nil {
+		return nil, err
+	}
 	router := NewRouter(store, cfg.MaxMessageSize, cfg.RateLimitPerMin)
 	return &Server{
-		cfg:     cfg,
-		store:   store,
-		prekeys: prekeys,
-		router:  router,
-		auth:    NewAuthenticator(log),
-		log:     log,
+		cfg:      cfg,
+		store:    store,
+		prekeys:  prekeys,
+		router:   router,
+		auth:     NewAuthenticator(log),
+		sealedCA: sealedCA,
+		log:      log,
 	}, nil
 }
 
@@ -69,6 +75,11 @@ func (s *Server) Run(ctx context.Context) error {
 	// owning client (over an authenticated WebSocket) can replace its
 	// own bundle, which is what binds the published keys to a userID.
 	mux.HandleFunc("/prekeys/", s.handlePrekeysGet)
+	// /sealed-ca — PUBLIC, no auth. Returns the sealed-sender CA public
+	// key for clients to pin. It is a public key by definition; gating it
+	// on auth would, like /prekeys, break the bootstrap case (a client
+	// needs it to validate the very first sealed message it receives).
+	mux.HandleFunc("/sealed-ca", s.handleSealedCA)
 
 	// TLS 1.3 only. We pin both Min and Max to 1.3:
 	//   - 1.2 still permits RSA key exchange (no PFS) and CBC modes
@@ -202,7 +213,7 @@ func (s *Server) serveConn(parentCtx context.Context, c *websocket.Conn, remoteA
 		if typ != websocket.MessageText && typ != websocket.MessageBinary {
 			continue
 		}
-		s.handleAuthedFrame(ctx, userID, data)
+		s.handleAuthedFrame(ctx, userID, c, data)
 	}
 }
 
@@ -213,7 +224,7 @@ func (s *Server) serveConn(parentCtx context.Context, c *websocket.Conn, remoteA
 // like prekey bundle registration ARE tagged, with `type`, because there
 // is no envelope-shape ambiguity to inherit. Order matters: type-sniff
 // first, fall through to envelope routing on miss.
-func (s *Server) handleAuthedFrame(ctx context.Context, userID string, data []byte) {
+func (s *Server) handleAuthedFrame(ctx context.Context, userID string, c *websocket.Conn, data []byte) {
 	var hdr struct {
 		Type string `json:"type"`
 	}
@@ -221,7 +232,11 @@ func (s *Server) handleAuthedFrame(ctx context.Context, userID string, data []by
 	// itself diagnostic — the envelope branch below will try its own
 	// unmarshal and silently drop on malformed input, matching the
 	// existing no-feedback policy for invalid client frames.
-	if err := json.Unmarshal(data, &hdr); err == nil && hdr.Type == "register_prekeys" {
+	if err := json.Unmarshal(data, &hdr); err == nil && hdr.Type == "request_sender_cert" {
+		s.issueSenderCert(ctx, userID, c)
+		return
+	}
+	if hdr.Type == "register_prekeys" {
 		var msg struct {
 			Bundle PrekeyBundle `json:"bundle"`
 		}
@@ -247,6 +262,56 @@ func (s *Server) handleAuthedFrame(ctx context.Context, userID string, data []by
 		return
 	}
 	s.router.Route(ctx, userID, data)
+}
+
+// issueSenderCert signs and returns a sealed-sender certificate for the
+// authenticated user.
+//
+// SECURITY: cert.uid is the AUTHENTICATED userID and cert.ik is taken from
+// that user's OWN registered prekey bundle — never from anything the client
+// put in the request. If the user has not registered a bundle yet there is
+// no authoritative identity key to certify, so we drop silently (no error
+// body — same no-oracle policy as the rest of the authed frame path).
+func (s *Server) issueSenderCert(ctx context.Context, userID string, c *websocket.Conn) {
+	ik, ok := s.prekeys.identityKeyOf(userID)
+	if !ok {
+		return
+	}
+	cert, sig, err := s.sealedCA.IssueCert(userID, ik, time.Now())
+	if err != nil {
+		s.log.Error("sender cert issue failed", "err_type", "sign")
+		return
+	}
+	resp, err := json.Marshal(struct {
+		Type      string `json:"type"`
+		Cert      []byte `json:"cert"`
+		Signature []byte `json:"signature"`
+	}{Type: "sender_cert", Cert: cert, Signature: sig})
+	if err != nil {
+		return
+	}
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_ = c.Write(wctx, websocket.MessageText, resp)
+}
+
+// handleSealedCA serves the sealed-sender CA public key for client pinning.
+// Public, GET-only, no-store — analogous to /prekeys but a single static
+// value. No body on the wrong method, consistent with the no-fingerprint
+// policy on /health.
+func (s *Server) handleSealedCA(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := json.NewEncoder(w).Encode(struct {
+		PublicKey string `json:"public_key"`
+	}{PublicKey: s.sealedCA.PublicKeyB64()}); err != nil {
+		s.log.Error("sealed-ca response write failed", "err_type", classifyErr(err))
+	}
 }
 
 // handlePrekeysGet serves a per-user prekey bundle, consuming one
