@@ -56,6 +56,7 @@ type PrekeyBundle struct {
 	IdentityKey     string          `json:"identity_key"`      // b64 32B
 	SignedPrekey    string          `json:"signed_prekey"`     // b64 32B
 	SignedPrekeySig string          `json:"signed_prekey_sig"` // b64 64B
+	SignedPrekeyID  uint32          `json:"signed_prekey_id"`  // 1-based; recipient looks up its private half by this id
 	OneTimePrekeys  []OneTimePrekey `json:"one_time_prekeys"`
 }
 
@@ -68,6 +69,7 @@ type PrekeyResponse struct {
 	IdentityKey     string         `json:"identity_key"`
 	SignedPrekey    string         `json:"signed_prekey"`
 	SignedPrekeySig string         `json:"signed_prekey_sig"`
+	SignedPrekeyID  uint32         `json:"signed_prekey_id"`
 	OneTimePrekey   *OneTimePrekey `json:"one_time_prekey,omitempty"`
 }
 
@@ -162,6 +164,7 @@ func (ps *PrekeyStore) getBundle(userID string) (*PrekeyResponse, bool) {
 		IdentityKey:     b.IdentityKey,
 		SignedPrekey:    b.SignedPrekey,
 		SignedPrekeySig: b.SignedPrekeySig,
+		SignedPrekeyID:  b.SignedPrekeyID,
 	}
 	if len(b.OneTimePrekeys) > 0 {
 		// Pop head; bundle is now mutated, persist immediately so a
@@ -227,6 +230,14 @@ func validatePrekeyBundle(b PrekeyBundle) error {
 	}
 	if err := checkBase64Len(b.SignedPrekeySig, prekeySigLen); err != nil {
 		return errors.New("invalid signed_prekey_sig")
+	}
+	// Signed-prekey ids are 1-based on the client (libsignal). A zero id
+	// can only mean the field was absent/unparsed in the uploaded bundle,
+	// which would be served verbatim and strand the recipient with
+	// InvalidKeyIdException("No such signedprekeyrecord! 0"). Reject at
+	// register time rather than persist a bundle doomed to fail on fetch.
+	if b.SignedPrekeyID == 0 {
+		return errors.New("invalid signed_prekey_id")
 	}
 	if len(b.OneTimePrekeys) > maxOneTimePrekeys {
 		return errors.New("too many one_time_prekeys")
