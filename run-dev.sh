@@ -33,11 +33,20 @@ export SPECTRE_PREKEY_PATH="${SPECTRE_PREKEY_PATH:-$DATA_DIR/prekeys.enc}"
 export SPECTRE_SEALED_CA_PATH="${SPECTRE_SEALED_CA_PATH:-$DATA_DIR/sealed_ca.key}"
 
 echo "Starting Spectre relay (DEV) on ${SPECTRE_LISTEN_ADDR}"
+# Primary LAN IP (source address of the default route). A second device — the
+# Mac — must use THIS, not localhost, to reach the relay over the network.
+LAN_IP="$(ip route get 1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' | head -1)"
+LAN_IP="${LAN_IP:-<your-LAN-IP>}"
+PORT="${SPECTRE_LISTEN_ADDR##*:}"
+
 echo "  data dir:  ${DATA_DIR}"
-echo "  ws url:    ws://localhost${SPECTRE_LISTEN_ADDR}/ws"
-echo "  sealed-ca: http://localhost${SPECTRE_LISTEN_ADDR}/sealed-ca"
-echo "Point the app at it with:"
-echo "  flutter run -d linux --dart-define=SPECTRE_RELAY_URL=ws://localhost${SPECTRE_LISTEN_ADDR}/ws"
+echo "  ws url:    ws://localhost:${PORT}/ws"
+echo "  sealed-ca: http://localhost:${PORT}/sealed-ca"
+echo "This device (same box, e.g. Linux app):"
+echo "  RELAY_HOST=localhost ./run-linux.sh        # or just ./run-linux.sh"
+echo "Other device on the LAN (e.g. the Mac):"
+echo "  RELAY_HOST=${LAN_IP} ./run-macos.sh"
+echo "  (firewall: sudo ufw allow ${PORT}/tcp  if it can't connect)"
 echo
 
 # exec so signals (Ctrl-C / SIGTERM) reach the relay for its graceful drain.
