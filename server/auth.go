@@ -173,18 +173,8 @@ func (a *Authenticator) Authenticate(ctx context.Context, c *websocket.Conn, rem
 	if err := wsjson.Write(hsCtx, c, model.AuthResponse{Success: true}); err != nil {
 		return "", ErrAuthFailed
 	}
-	// TODO: remove before production
-	// (Authenticator has its own logger; the user-facing spec referenced
-	//  `s.log`, but auth.go runs before serveConn assigns `s` — `a.log`
-	//  is the equivalent and is unconditional, unlike the SPECTRE_DEBUG-
-	//  gated a.dbg().)
-	if a.log != nil {
-		uidPrefix := req.UserID
-		if len(uidPrefix) > 8 {
-			uidPrefix = uidPrefix[:8]
-		}
-		a.log.Info("DEV auth success", "uid_prefix", uidPrefix)
-	}
+	// No success log: which user authenticated (even a prefix) is exactly the
+	// metadata the relay must not record.
 	return req.UserID, nil
 }
 

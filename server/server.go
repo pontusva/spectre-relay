@@ -252,13 +252,9 @@ func (s *Server) handleAuthedFrame(ctx context.Context, userID string, c *websoc
 			s.log.Warn("prekey register rejected", "err_type", "validate")
 			return
 		}
-		s.log.Info("prekey bundle registered")
-		// TODO: remove before production
-		uidPrefix := userID
-		if len(uidPrefix) > 8 {
-			// uidPrefix = uidPrefix[:8] — DEV: show full ID
-		}
-		s.log.Info("DEV prekey registered", "uid_prefix", uidPrefix)
+		// Debug level + no identifier: the fact that *a* bundle registered is
+		// fine for ops; WHICH user registered is metadata we must not log.
+		s.log.Debug("prekey bundle registered")
 		return
 	}
 	s.router.Route(ctx, userID, data)
