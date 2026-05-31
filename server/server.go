@@ -23,13 +23,20 @@ type Server struct {
 	cfg     *config.Config
 	store   *Store
 	prekeys *PrekeyStore
-	router   *Router
-	auth     *Authenticator
-	sealedCA *SealedCA
-	log      *slog.Logger
-	hs       *http.Server
-	active   int64
+	router      *Router
+	auth        *Authenticator
+	sealedCA    *SealedCA
+	certLimiter *rateLimiter
+	log         *slog.Logger
+	hs          *http.Server
+	active      int64
 }
+
+// Max sealed-sender certificate requests per authenticated user per minute.
+// Certs are valid ~24h and cached client-side, so a legitimate client asks
+// roughly once per connect — a small ceiling is plenty and bounds CA-signing
+// abuse.
+const certRequestsPerMin = 6
 
 func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	store, err := NewStore(cfg.OfflineQueuePath, cfg.MessageTTLSeconds, log)
@@ -50,9 +57,10 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		store:    store,
 		prekeys:  prekeys,
 		router:   router,
-		auth:     NewAuthenticator(log),
-		sealedCA: sealedCA,
-		log:      log,
+		auth:        NewAuthenticator(log),
+		sealedCA:    sealedCA,
+		certLimiter: newRateLimiter(certRequestsPerMin),
+		log:         log,
 	}, nil
 }
 
@@ -269,13 +277,13 @@ func (s *Server) handleAuthedFrame(ctx context.Context, userID string, c *websoc
 // no authoritative identity key to certify, so we drop silently (no error
 // body — same no-oracle policy as the rest of the authed frame path).
 func (s *Server) issueSenderCert(ctx context.Context, userID string, c *websocket.Conn) {
-	ik, ok := s.prekeys.identityKeyOf(userID)
-	if !ok {
+	// Bound CA-signing abuse per user. Silent drop on exceed — no feedback,
+	// consistent with the rest of the authed-frame path.
+	if !s.certLimiter.allow(userID, time.Now()) {
 		return
 	}
-	cert, sig, err := s.sealedCA.IssueCert(userID, ik, time.Now())
-	if err != nil {
-		s.log.Error("sender cert issue failed", "err_type", "sign")
+	cert, sig, ok := s.buildSenderCert(userID, time.Now())
+	if !ok {
 		return
 	}
 	resp, err := json.Marshal(struct {
@@ -289,6 +297,24 @@ func (s *Server) issueSenderCert(ctx context.Context, userID string, c *websocke
 	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	_ = c.Write(wctx, websocket.MessageText, resp)
+}
+
+// buildSenderCert builds and signs a sealed-sender certificate for the
+// AUTHENTICATED userID, binding it to the identity key from THAT user's own
+// registered prekey bundle (never anything the client supplied). Returns
+// ok=false if the user has no registered bundle — there is then no
+// authoritative identity key to certify. Pure of WS I/O so it is unit-testable.
+func (s *Server) buildSenderCert(userID string, now time.Time) (cert, sig []byte, ok bool) {
+	ik, found := s.prekeys.identityKeyOf(userID)
+	if !found {
+		return nil, nil, false
+	}
+	cert, sig, err := s.sealedCA.IssueCert(userID, ik, now)
+	if err != nil {
+		s.log.Error("sender cert issue failed", "err_type", "sign")
+		return nil, nil, false
+	}
+	return cert, sig, true
 }
 
 // handleSealedCA serves the sealed-sender CA public key for client pinning.
