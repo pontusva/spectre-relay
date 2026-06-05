@@ -15,6 +15,7 @@ import (
 	"nhooyr.io/websocket"
 
 	"spectre-relay/config"
+	"spectre-relay/model"
 )
 
 // Server wires the WebSocket entrypoint, the auth handshake, the router,
@@ -51,7 +52,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	router := NewRouter(store, cfg.MaxMessageSize, cfg.RateLimitPerMin)
+	router := NewRouter(store, cfg.MaxMessageSize, cfg.RateLimitPerMin, cfg.RelayID)
 	return &Server{
 		cfg:      cfg,
 		store:    store,
@@ -88,6 +89,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// on auth would, like /prekeys, break the bootstrap case (a client
 	// needs it to validate the very first sealed message it receives).
 	mux.HandleFunc("/sealed-ca", s.handleSealedCA)
+	mux.HandleFunc("/federation/deliver", s.handleFederationDeliver)
 
 	// TLS 1.3 only. We pin both Min and Max to 1.3:
 	//   - 1.2 still permits RSA key exchange (no PFS) and CBC modes
@@ -202,6 +204,19 @@ func (s *Server) serveConn(parentCtx context.Context, c *websocket.Conn, remoteA
 		return
 	}
 	// From here on, neither `ip` nor `userID` may appear in any log line.
+
+	// Normalize namespaced userID for registration/local matching if it's local
+	parts := strings.SplitN(userID, "@", 2)
+	if len(parts) == 2 {
+		domain := parts[1]
+		host := domain
+		if h, _, err := net.SplitHostPort(domain); err == nil {
+			host = h
+		}
+		if host == s.cfg.RelayID {
+			userID = parts[0]
+		}
+	}
 
 	if prev := s.store.Register(userID, c); prev != nil {
 		_ = prev.Close(websocket.StatusNormalClosure, "")
@@ -387,4 +402,41 @@ func classifyWSErr(err error) string {
 		return "net"
 	}
 	return "ws"
+}
+
+func (s *Server) handleFederationDeliver(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var sealed model.SealedEnvelope
+	if err := json.NewDecoder(r.Body).Decode(&sealed); err != nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if sealed.RecipientID == "" || len(sealed.Ciphertext) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// RecipientID must be a local user (no @ or domain matches local RELAY_ID)
+	parts := strings.SplitN(sealed.RecipientID, "@", 2)
+	if len(parts) == 2 {
+		domain := parts[1]
+		host := domain
+		if h, _, err := net.SplitHostPort(domain); err == nil {
+			host = h
+		}
+		if host != s.cfg.RelayID {
+			// Drop silently
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
+	s.router.deliver(r.Context(), sealed.RecipientID, queuedMessage{Sealed: &sealed})
+	w.WriteHeader(http.StatusNoContent)
 }

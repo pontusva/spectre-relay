@@ -22,6 +22,8 @@ type Config struct {
 	PrekeyStorePath   string
 	SealedCAPath      string
 	DevMode           bool
+	RelayID           string
+	FederationAddr    string
 }
 
 // Load reads the environment and applies secure defaults.
@@ -47,6 +49,8 @@ func Load() (*Config, error) {
 		// key forges sender attribution but reads no content (see SealedCA).
 		SealedCAPath: getEnv("SPECTRE_SEALED_CA_PATH", "/data/sealed_ca.key"),
 		DevMode:      os.Getenv("SPECTRE_DEV") == "true",
+		RelayID:      getEnv("RELAY_ID", ""),
+		FederationAddr: getEnv("FEDERATION_ADDR", ""),
 	}
 
 	if !cfg.DevMode {
@@ -66,8 +70,8 @@ func Load() (*Config, error) {
 // Cert paths are omitted: a path leak can reveal deployment layout.
 func (c *Config) SafeSummary() string {
 	return fmt.Sprintf(
-		"listen=%s max_clients=%d msg_ttl_s=%d max_msg_size=%d rate_limit_per_min=%d dev=%t",
-		c.ListenAddr, c.MaxClients, c.MessageTTLSeconds, c.MaxMessageSize, c.RateLimitPerMin, c.DevMode,
+		"listen=%s max_clients=%d msg_ttl_s=%d max_msg_size=%d rate_limit_per_min=%d dev=%t relay_id=%s fed_addr=%s",
+		c.ListenAddr, c.MaxClients, c.MessageTTLSeconds, c.MaxMessageSize, c.RateLimitPerMin, c.DevMode, c.RelayID, c.FederationAddr,
 	)
 }
 

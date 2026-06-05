@@ -1,8 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,15 +24,17 @@ type Router struct {
 	store          *Store
 	maxMessageSize int
 	ratePerMin     int
+	relayID        string
 	rateMu         sync.Mutex
 	rateAttempts   map[string][]time.Time
 }
 
-func NewRouter(store *Store, maxMessageSize, ratePerMin int) *Router {
+func NewRouter(store *Store, maxMessageSize, ratePerMin int, relayID string) *Router {
 	return &Router{
 		store:          store,
 		maxMessageSize: maxMessageSize,
 		ratePerMin:     ratePerMin,
+		relayID:        relayID,
 		rateAttempts:   make(map[string][]time.Time),
 	}
 }
@@ -91,7 +98,45 @@ func (r *Router) Route(ctx context.Context, senderID string, payload []byte) {
 	// Drop silently.
 }
 
+var federationClient = &http.Client{
+	Timeout: 10 * time.Second,
+}
+
+func (r *Router) forwardFederated(domain string, sealed *model.SealedEnvelope) {
+	url := fmt.Sprintf("http://%s/federation/deliver", domain)
+	body, err := json.Marshal(sealed)
+	if err != nil {
+		return
+	}
+	resp, err := federationClient.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+}
+
 func (r *Router) deliver(ctx context.Context, recipientID string, m queuedMessage) {
+	// Parse namespaced recipient ID
+	parts := strings.SplitN(recipientID, "@", 2)
+	if len(parts) == 2 {
+		domain := parts[1]
+		host := domain
+		if h, _, err := net.SplitHostPort(domain); err == nil {
+			host = h
+		}
+		if host != r.relayID {
+			// Federated recipient
+			if m.Sealed == nil {
+				// Drop silently: federated delivery is sealed sender only
+				return
+			}
+			go r.forwardFederated(domain, m.Sealed)
+			return
+		}
+		// Local recipient with local domain namespace: normalize to username
+		recipientID = parts[0]
+	}
+
 	conn, online := r.store.LookupClient(recipientID)
 	if online {
 		raw, err := marshalQueued(m)

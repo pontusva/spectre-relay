@@ -23,6 +23,7 @@ services:
       SPECTRE_QUEUE_PATH: "/data/offline_queue.enc"
       SPECTRE_DEV: "true"
       RELAY_ID: "relay-a"
+      FEDERATION_ADDR: "http://relay-a:8080"
     # Drop ALL kernel capabilities.
     cap_drop:
       - ALL
@@ -55,6 +56,7 @@ services:
       SPECTRE_QUEUE_PATH: "/data/offline_queue.enc"
       SPECTRE_DEV: "true"
       RELAY_ID: "relay-b"
+      FEDERATION_ADDR: "http://relay-b:8081"
     # Drop ALL kernel capabilities.
     cap_drop:
       - ALL
