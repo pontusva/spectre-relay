@@ -1,19 +1,23 @@
 package server
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
 	"nhooyr.io/websocket"
+	_ "modernc.org/sqlite"
 
 	"spectre-relay/model"
 )
@@ -44,7 +48,8 @@ type queuedMessage struct {
 type Store struct {
 	mu        sync.RWMutex
 	clients   map[string]*websocket.Conn
-	queue     map[string][]queuedMessage
+	db        *sql.DB
+	conn      *sql.Conn
 	queuePath string
 	key       []byte
 	ttl       time.Duration
@@ -63,18 +68,35 @@ func NewStore(queuePath string, ttlSeconds int64, log *slog.Logger) (*Store, err
 	if err != nil {
 		return nil, err
 	}
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	s := &Store{
 		clients:   make(map[string]*websocket.Conn),
-		queue:     make(map[string][]queuedMessage),
+		db:        db,
+		conn:      conn,
 		queuePath: queuePath,
 		key:       key,
 		ttl:       time.Duration(ttlSeconds) * time.Second,
 		log:       log,
 		stopCh:    make(chan struct{}),
 	}
+
 	if err := s.loadFromDisk(); err != nil {
+		s.conn.Close()
+		s.db.Close()
 		return nil, err
 	}
+
 	go s.purgeLoop()
 	return s, nil
 }
@@ -116,28 +138,46 @@ func (s *Store) Enqueue(recipientID string, msg queuedMessage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	q := s.queue[recipientID]
+	ctx := context.Background()
 
 	// Drop expired entries at insertion to keep the cap meaningful.
-	now := time.Now().Unix()
-	live := q[:0]
-	for _, m := range q {
-		if m.ExpiresAt > now {
-			live = append(live, m)
-		}
-	}
-	q = live
-
-	if len(q) >= maxQueuePerRecipient {
-		s.queue[recipientID] = q
+	_, err := s.conn.ExecContext(ctx, "DELETE FROM queue WHERE recipient_id = ? AND expires_at < unixepoch()", recipientID)
+	if err != nil {
+		s.log.Error("queue delete expired failed", "err_type", classifyErr(err))
 		return
 	}
+
+	var count int
+	err = s.conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM queue WHERE recipient_id = ?", recipientID).Scan(&count)
+	if err != nil {
+		s.log.Error("queue count failed", "err_type", classifyErr(err))
+		return
+	}
+
+	if count >= maxQueuePerRecipient {
+		return
+	}
+
 	msg.ExpiresAt = time.Now().Add(s.ttl).Unix()
-	q = append(q, msg)
-	s.queue[recipientID] = q
+	plaintext, err := json.Marshal(msg)
+	if err != nil {
+		s.log.Error("queue marshal failed", "err_type", classifyErr(err))
+		return
+	}
+
+	ciphertext, err := s.encrypt(plaintext)
+	if err != nil {
+		s.log.Error("queue encrypt failed", "err_type", classifyErr(err))
+		return
+	}
+
+	_, err = s.conn.ExecContext(ctx, "INSERT INTO queue (recipient_id, payload, expires_at) VALUES (?, ?, ?)", recipientID, ciphertext, msg.ExpiresAt)
+	if err != nil {
+		s.log.Error("queue insert failed", "err_type", classifyErr(err))
+		return
+	}
 
 	if err := s.persistLocked(); err != nil {
-		// Log only the error class — never the recipient ID or content.
 		s.log.Error("queue persist failed", "err_type", classifyErr(err))
 	}
 }
@@ -146,19 +186,65 @@ func (s *Store) Enqueue(recipientID string, msg queuedMessage) {
 func (s *Store) DrainQueue(recipientID string) []queuedMessage {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	q := s.queue[recipientID]
-	now := time.Now().Unix()
-	live := make([]queuedMessage, 0, len(q))
-	for _, m := range q {
-		if m.ExpiresAt > now {
-			live = append(live, m)
-		}
+
+	ctx := context.Background()
+
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		s.log.Error("queue tx begin failed", "err_type", classifyErr(err))
+		return nil
 	}
-	delete(s.queue, recipientID)
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, "SELECT payload, expires_at FROM queue WHERE recipient_id = ? ORDER BY id ASC", recipientID)
+	if err != nil {
+		s.log.Error("queue query failed", "err_type", classifyErr(err))
+		return nil
+	}
+	defer rows.Close()
+
+	now := time.Now().Unix()
+	var messages []queuedMessage
+	for rows.Next() {
+		var ciphertext []byte
+		var expiresAt int64
+		if err := rows.Scan(&ciphertext, &expiresAt); err != nil {
+			s.log.Error("queue scan failed", "err_type", classifyErr(err))
+			continue
+		}
+		if expiresAt < now {
+			continue
+		}
+		plaintext, err := s.decrypt(ciphertext)
+		if err != nil {
+			s.log.Error("queue decrypt failed", "err_type", classifyErr(err))
+			continue
+		}
+		var msg queuedMessage
+		if err := json.Unmarshal(plaintext, &msg); err != nil {
+			s.log.Error("queue unmarshal failed", "err_type", classifyErr(err))
+			continue
+		}
+		messages = append(messages, msg)
+	}
+	rows.Close()
+
+	_, err = tx.ExecContext(ctx, "DELETE FROM queue WHERE recipient_id = ?", recipientID)
+	if err != nil {
+		s.log.Error("queue delete failed", "err_type", classifyErr(err))
+		return nil
+	}
+
+	if err := tx.Commit(); err != nil {
+		s.log.Error("queue commit failed", "err_type", classifyErr(err))
+		return nil
+	}
+
 	if err := s.persistLocked(); err != nil {
 		s.log.Error("queue persist failed", "err_type", classifyErr(err))
 	}
-	return live
+
+	return messages
 }
 
 // ConnectedClients is an ops metric: count only, no identifiers.
@@ -170,16 +256,19 @@ func (s *Store) ConnectedClients() int {
 
 // QueuedMessages is an ops metric: total across all users, no per-user data.
 func (s *Store) QueuedMessages() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	total := 0
-	for _, q := range s.queue {
-		total += len(q)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var total int
+	err := s.conn.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM queue WHERE expires_at >= unixepoch()").Scan(&total)
+	if err != nil {
+		s.log.Error("queue count failed", "err_type", classifyErr(err))
+		return 0
 	}
 	return total
 }
 
-// Stop terminates the background purge goroutine. Call during shutdown.
+// Stop terminates the background purge goroutine and closes the database connection.
 func (s *Store) Stop() {
 	select {
 	case <-s.stopCh:
@@ -187,11 +276,17 @@ func (s *Store) Stop() {
 	default:
 		close(s.stopCh)
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn != nil {
+		s.conn.Close()
+	}
+	if s.db != nil {
+		s.db.Close()
+	}
 }
 
 // purgeLoop runs every 5 minutes, removing expired entries.
-// Persisted state is rewritten on each pass so a crash never leaves
-// expired ciphertext lingering past its TTL on disk.
 func (s *Store) purgeLoop() {
 	t := time.NewTicker(5 * time.Minute)
 	defer t.Stop()
@@ -208,36 +303,115 @@ func (s *Store) purgeLoop() {
 func (s *Store) purgeExpired() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now().Unix()
-	for uid, q := range s.queue {
-		live := q[:0]
-		for _, m := range q {
-			if m.ExpiresAt > now {
-				live = append(live, m)
-			}
-		}
-		if len(live) == 0 {
-			delete(s.queue, uid)
-		} else {
-			s.queue[uid] = live
-		}
+	_, err := s.conn.ExecContext(context.Background(), "DELETE FROM queue WHERE expires_at < unixepoch()")
+	if err != nil {
+		s.log.Error("queue purge failed", "err_type", classifyErr(err))
+		return
 	}
 	if err := s.persistLocked(); err != nil {
 		s.log.Error("queue persist failed", "err_type", classifyErr(err))
 	}
 }
 
-// persistLocked encrypts the in-memory queue map and writes it to disk
-// atomically. Caller MUST hold s.mu.
-//
-// Layout on disk: [12-byte GCM nonce][ciphertext||tag].
-// Atomic write via tempfile + rename so a crash mid-write cannot
-// produce a torn file that fails authentication on load.
-func (s *Store) persistLocked() error {
-	plaintext, err := json.Marshal(s.queue)
+func (s *Store) encrypt(plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(s.key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+func (s *Store) decrypt(ciphertext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(s.key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	if len(ciphertext) < gcm.NonceSize() {
+		return nil, errors.New("ciphertext too short")
+	}
+	nonce, ct := ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():]
+	return gcm.Open(nil, nonce, ct, nil)
+}
+
+func (s *Store) loadFromDisk() error {
+	data, err := os.ReadFile(s.queuePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return s.initSchema()
+		}
+		return err
+	}
+	if len(data) == 0 {
+		return s.initSchema()
+	}
+
+	block, err := aes.NewCipher(s.key)
 	if err != nil {
 		return err
 	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
+	if len(data) < gcm.NonceSize() {
+		return errors.New("queue file truncated")
+	}
+	nonce, ct := data[:gcm.NonceSize()], data[gcm.NonceSize():]
+	plain, err := gcm.Open(nil, nonce, ct, nil)
+	if err != nil {
+		return errors.New("queue authentication failed")
+	}
+
+	err = s.conn.Raw(func(driverConn interface{}) error {
+		return deserializeDB(driverConn, plain)
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Store) initSchema() error {
+	_, err := s.conn.ExecContext(context.Background(), `
+		CREATE TABLE IF NOT EXISTS queue (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			recipient_id TEXT NOT NULL,
+			payload BLOB NOT NULL,
+			expires_at INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_queue_recipient_expires ON queue (recipient_id, expires_at);
+		CREATE INDEX IF NOT EXISTS idx_queue_expires ON queue (expires_at);
+	`)
+	if err != nil {
+		return err
+	}
+	return s.persistLocked()
+}
+
+func (s *Store) persistLocked() error {
+	var plain []byte
+	err := s.conn.Raw(func(driverConn interface{}) error {
+		var err error
+		plain, err = serializeDB(driverConn)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+
 	block, err := aes.NewCipher(s.key)
 	if err != nil {
 		return err
@@ -250,7 +424,7 @@ func (s *Store) persistLocked() error {
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return err
 	}
-	sealed := gcm.Seal(nonce, nonce, plaintext, nil)
+	sealed := gcm.Seal(nonce, nonce, plain, nil)
 
 	dir := filepath.Dir(s.queuePath)
 	tmp, err := os.CreateTemp(dir, "queue-*.tmp")
@@ -275,52 +449,34 @@ func (s *Store) persistLocked() error {
 	return os.Rename(tmpName, s.queuePath)
 }
 
-// loadFromDisk reads the encrypted queue file (if present) and restores
-// only non-expired entries.
-func (s *Store) loadFromDisk() error {
-	data, err := os.ReadFile(s.queuePath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
+func serializeDB(driverConn interface{}) ([]byte, error) {
+	val := reflect.ValueOf(driverConn)
+	method := val.MethodByName("Serialize")
+	if !method.IsValid() {
+		return nil, errors.New("Serialize method not found on driver connection")
 	}
-	if len(data) == 0 {
-		return nil
+	results := method.Call(nil)
+	if len(results) != 2 {
+		return nil, errors.New("unexpected number of return values from Serialize")
 	}
-	block, err := aes.NewCipher(s.key)
-	if err != nil {
-		return err
+	if !results[1].IsNil() {
+		return nil, results[1].Interface().(error)
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
+	return results[0].Bytes(), nil
+}
+
+func deserializeDB(driverConn interface{}, data []byte) error {
+	val := reflect.ValueOf(driverConn)
+	method := val.MethodByName("Deserialize")
+	if !method.IsValid() {
+		return errors.New("Deserialize method not found on driver connection")
 	}
-	if len(data) < gcm.NonceSize() {
-		return errors.New("queue file truncated")
+	results := method.Call([]reflect.Value{reflect.ValueOf(data)})
+	if len(results) != 1 {
+		return errors.New("unexpected number of return values from Deserialize")
 	}
-	nonce, ct := data[:gcm.NonceSize()], data[gcm.NonceSize():]
-	plain, err := gcm.Open(nil, nonce, ct, nil)
-	if err != nil {
-		// Authentication failure: refuse to start rather than serve
-		// a possibly-tampered queue file.
-		return errors.New("queue authentication failed")
-	}
-	var loaded map[string][]queuedMessage
-	if err := json.Unmarshal(plain, &loaded); err != nil {
-		return err
-	}
-	now := time.Now().Unix()
-	for uid, q := range loaded {
-		live := q[:0]
-		for _, m := range q {
-			if m.ExpiresAt > now {
-				live = append(live, m)
-			}
-		}
-		if len(live) > 0 {
-			s.queue[uid] = live
-		}
+	if !results[0].IsNil() {
+		return results[0].Interface().(error)
 	}
 	return nil
 }

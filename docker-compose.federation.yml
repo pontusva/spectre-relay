@@ -1,0 +1,66 @@
+version: "3.9"
+
+services:
+  relay-a:
+    build: .
+    container_name: relay-a
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # TLS material — read-only.
+      - ./certs-a:/certs:ro
+      # Data directory for SQLite DB and key.
+      - ./data-a:/data
+    environment:
+      SPECTRE_LISTEN_ADDR: ":8080"
+      SPECTRE_TLS_CERT: ""
+      SPECTRE_TLS_KEY: ""
+      SPECTRE_MAX_CLIENTS: "10000"
+      SPECTRE_MESSAGE_TTL: "604800"
+      SPECTRE_MAX_MESSAGE_SIZE: "65536"
+      SPECTRE_RATE_LIMIT_PER_MIN: "60"
+      SPECTRE_QUEUE_PATH: "/data/offline_queue.enc"
+      SPECTRE_DEV: "true"
+      RELAY_ID: "relay-a"
+    # Drop ALL kernel capabilities.
+    cap_drop:
+      - ALL
+    # No new privileges, read-only root FS — /data and /certs are the only writable mounts.
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  relay-b:
+    build: .
+    container_name: relay-b
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    volumes:
+      # TLS material — read-only.
+      - ./certs-b:/certs:ro
+      # Data directory for SQLite DB and key.
+      - ./data-b:/data
+    environment:
+      SPECTRE_LISTEN_ADDR: ":8081"
+      SPECTRE_TLS_CERT: ""
+      SPECTRE_TLS_KEY: ""
+      SPECTRE_MAX_CLIENTS: "10000"
+      SPECTRE_MESSAGE_TTL: "604800"
+      SPECTRE_MAX_MESSAGE_SIZE: "65536"
+      SPECTRE_RATE_LIMIT_PER_MIN: "60"
+      SPECTRE_QUEUE_PATH: "/data/offline_queue.enc"
+      SPECTRE_DEV: "true"
+      RELAY_ID: "relay-b"
+    # Drop ALL kernel capabilities.
+    cap_drop:
+      - ALL
+    # No new privileges, read-only root FS — /data and /certs are the only writable mounts.
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
