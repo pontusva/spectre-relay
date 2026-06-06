@@ -411,6 +411,12 @@ func (s *Server) handleFederationDeliver(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	relayID := r.Header.Get("X-Spectre-Relay-ID")
+	if relayID == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	var sealed model.SealedEnvelope
 	if err := json.NewDecoder(r.Body).Decode(&sealed); err != nil {
 		w.WriteHeader(http.StatusNoContent)
@@ -436,6 +442,10 @@ func (s *Server) handleFederationDeliver(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
+
+	// Stamp the sealed.RecipientID to strip any existing @ suffix and use only the local username part
+	sealed.RecipientID = parts[0]
+	sealed.FederationSenderRelay = relayID
 
 	s.router.deliver(r.Context(), sealed.RecipientID, queuedMessage{Sealed: &sealed})
 	w.WriteHeader(http.StatusNoContent)

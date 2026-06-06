@@ -108,7 +108,13 @@ func (r *Router) forwardFederated(domain string, sealed *model.SealedEnvelope) {
 	if err != nil {
 		return
 	}
-	resp, err := federationClient.Post(url, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Spectre-Relay-ID", r.relayID)
+	resp, err := federationClient.Do(req)
 	if err != nil {
 		return
 	}

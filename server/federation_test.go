@@ -22,9 +22,11 @@ func TestFederation_OutboundRouting(t *testing.T) {
 	// 1. Set up a mock HTTP server to act as the remote relay
 	var receivedBody []byte
 	var receivedContentType string
+	var receivedRelayID string
 	remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/federation/deliver" && r.Method == http.MethodPost {
 			receivedContentType = r.Header.Get("Content-Type")
+			receivedRelayID = r.Header.Get("X-Spectre-Relay-ID")
 			var err error
 			receivedBody, err = io.ReadAll(r.Body)
 			if err != nil {
@@ -77,6 +79,10 @@ func TestFederation_OutboundRouting(t *testing.T) {
 		t.Errorf("Expected Content-Type application/json, got %q", receivedContentType)
 	}
 
+	if receivedRelayID != "relay-a" {
+		t.Errorf("Expected X-Spectre-Relay-ID 'relay-a', got %q", receivedRelayID)
+	}
+
 	var parsedSealed model.SealedEnvelope
 	if err := json.Unmarshal(receivedBody, &parsedSealed); err != nil {
 		t.Fatalf("Failed to unmarshal forwarded JSON: %v", err)
@@ -91,6 +97,7 @@ func TestFederation_OutboundRouting(t *testing.T) {
 	// Reset received variables
 	receivedBody = nil
 	receivedContentType = ""
+	receivedRelayID = ""
 
 	// 4. Test that OpenEnvelope is NOT forwarded to remote host
 	openMsg := queuedMessage{
@@ -175,6 +182,7 @@ func TestFederation_ReceiveEndpoint(t *testing.T) {
 		ID:          "msg-1",
 	})
 	req := httptest.NewRequest(http.MethodPost, "/federation/deliver", bytes.NewReader(reqBody))
+	req.Header.Set("X-Spectre-Relay-ID", "relay-b")
 	rec := httptest.NewRecorder()
 
 	srv.handleFederationDeliver(rec, req)
@@ -188,6 +196,53 @@ func TestFederation_ReceiveEndpoint(t *testing.T) {
 	if len(drained) != 1 {
 		t.Fatalf("Expected 1 message for alice, got %d", len(drained))
 	}
+	if drained[0].Sealed.RecipientID != "alice" {
+		t.Errorf("Expected RecipientID 'alice', got %q", drained[0].Sealed.RecipientID)
+	}
+	if drained[0].Sealed.FederationSenderRelay != "relay-b" {
+		t.Errorf("Expected FederationSenderRelay 'relay-b', got %q", drained[0].Sealed.FederationSenderRelay)
+	}
+
+	// 1b. Missing header (must return 204 and not enqueue)
+	reqBodyNoHeader, _ := json.Marshal(model.SealedEnvelope{
+		RecipientID: "charlie@relay-a",
+		Ciphertext:  []byte("hello charlie"),
+		ID:          "msg-no-header",
+	})
+	reqNoHeader := httptest.NewRequest(http.MethodPost, "/federation/deliver", bytes.NewReader(reqBodyNoHeader))
+	recNoHeader := httptest.NewRecorder()
+
+	srv.handleFederationDeliver(recNoHeader, reqNoHeader)
+
+	if recNoHeader.Code != http.StatusNoContent {
+		t.Errorf("Expected HTTP 204, got %d", recNoHeader.Code)
+	}
+
+	drainedCharlie := srv.store.DrainQueue("charlie")
+	if len(drainedCharlie) != 0 {
+		t.Errorf("Expected 0 messages for charlie, got %d", len(drainedCharlie))
+	}
+
+	// 1c. Empty header (must return 204 and not enqueue)
+	reqBodyEmptyHeader, _ := json.Marshal(model.SealedEnvelope{
+		RecipientID: "charlie@relay-a",
+		Ciphertext:  []byte("hello charlie"),
+		ID:          "msg-empty-header",
+	})
+	reqEmptyHeader := httptest.NewRequest(http.MethodPost, "/federation/deliver", bytes.NewReader(reqBodyEmptyHeader))
+	reqEmptyHeader.Header.Set("X-Spectre-Relay-ID", "")
+	recEmptyHeader := httptest.NewRecorder()
+
+	srv.handleFederationDeliver(recEmptyHeader, reqEmptyHeader)
+
+	if recEmptyHeader.Code != http.StatusNoContent {
+		t.Errorf("Expected HTTP 204, got %d", recEmptyHeader.Code)
+	}
+
+	drainedCharlie2 := srv.store.DrainQueue("charlie")
+	if len(drainedCharlie2) != 0 {
+		t.Errorf("Expected 0 messages for charlie, got %d", len(drainedCharlie2))
+	}
 
 	// 2. Reject remote recipient (drop silently with 204)
 	reqBodyRemote, _ := json.Marshal(model.SealedEnvelope{
@@ -196,6 +251,7 @@ func TestFederation_ReceiveEndpoint(t *testing.T) {
 		ID:          "msg-2",
 	})
 	reqRemote := httptest.NewRequest(http.MethodPost, "/federation/deliver", bytes.NewReader(reqBodyRemote))
+	reqRemote.Header.Set("X-Spectre-Relay-ID", "relay-b")
 	recRemote := httptest.NewRecorder()
 
 	srv.handleFederationDeliver(recRemote, reqRemote)

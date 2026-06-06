@@ -13,6 +13,13 @@ type SealedEnvelope struct {
 	TimestampMS int64  `json:"timestamp_ms"`
 	// ID is the SHA-256 hex of Ciphertext, used for relay-side dedup only.
 	ID string `json:"id"`
+
+	// FederationSenderRelay is set by the receiving relay when a message
+	// arrives via the /federation/deliver endpoint. It tells the recipient
+	// client which relay the sender is registered on, so replies can be
+	// routed correctly. Never set by clients — relay-only metadata.
+	// Empty for local (non-federated) messages.
+	FederationSenderRelay string `json:"federation_sender_relay,omitempty"`
 }
 
 // OpenEnvelope is the alternative wire form where the sender is disclosed.
