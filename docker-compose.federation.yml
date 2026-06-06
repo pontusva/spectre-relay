@@ -22,7 +22,7 @@ services:
       SPECTRE_RATE_LIMIT_PER_MIN: "60"
       SPECTRE_QUEUE_PATH: "/data/offline_queue.enc"
       SPECTRE_DEV: "true"
-      RELAY_ID: "relay-a"
+      RELAY_ID: "192.168.1.161:8080"
       FEDERATION_ADDR: "http://relay-a:8080"
     # Drop ALL kernel capabilities.
     cap_drop:
@@ -55,7 +55,7 @@ services:
       SPECTRE_RATE_LIMIT_PER_MIN: "60"
       SPECTRE_QUEUE_PATH: "/data/offline_queue.enc"
       SPECTRE_DEV: "true"
-      RELAY_ID: "relay-b"
+      RELAY_ID: "192.168.1.161:8081"
       FEDERATION_ADDR: "http://relay-b:8081"
     # Drop ALL kernel capabilities.
     cap_drop:
