@@ -121,20 +121,37 @@ func (r *Router) forwardFederated(domain string, sealed *model.SealedEnvelope) {
 	defer resp.Body.Close()
 }
 
+// isLocalRelay checks if the given domain refers to the local relay ID.
+// The domain is considered local if:
+// 1. The host name of the domain matches the host name of the relay ID.
+// 2. If the domain specifies a port, it must match the port of the relay ID.
+func isLocalRelay(domain string, relayID string) bool {
+	host, port, err := net.SplitHostPort(domain)
+	if err != nil {
+		host = domain
+		port = ""
+	}
+	relayHost, relayPort, err := net.SplitHostPort(relayID)
+	if err != nil {
+		relayHost = relayID
+		relayPort = ""
+	}
+
+	if host != relayHost {
+		return false
+	}
+	if port != "" && port != relayPort {
+		return false
+	}
+	return true
+}
+
 func (r *Router) deliver(ctx context.Context, recipientID string, m queuedMessage) {
 	// Parse namespaced recipient ID
 	parts := strings.SplitN(recipientID, "@", 2)
 	if len(parts) == 2 {
 		domain := parts[1]
-		host := domain
-		if h, _, err := net.SplitHostPort(domain); err == nil {
-			host = h
-		}
-		relayHost := r.relayID
-		if h, _, err := net.SplitHostPort(r.relayID); err == nil {
-			relayHost = h
-		}
-		if host != relayHost {
+		if !isLocalRelay(domain, r.relayID) {
 			// Federated recipient
 			if m.Sealed == nil {
 				// Drop silently: federated delivery is sealed sender only

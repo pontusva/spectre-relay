@@ -209,15 +209,7 @@ func (s *Server) serveConn(parentCtx context.Context, c *websocket.Conn, remoteA
 	parts := strings.SplitN(userID, "@", 2)
 	if len(parts) == 2 {
 		domain := parts[1]
-		host := domain
-		if h, _, err := net.SplitHostPort(domain); err == nil {
-			host = h
-		}
-		relayHost := s.cfg.RelayID
-		if h, _, err := net.SplitHostPort(s.cfg.RelayID); err == nil {
-			relayHost = h
-		}
-		if host == relayHost {
+		if isLocalRelay(domain, s.cfg.RelayID) {
 			userID = parts[0]
 		}
 	}
@@ -436,25 +428,18 @@ func (s *Server) handleFederationDeliver(w http.ResponseWriter, r *http.Request)
 	parts := strings.SplitN(sealed.RecipientID, "@", 2)
 	if len(parts) == 2 {
 		domain := parts[1]
-		host := domain
-		if h, _, err := net.SplitHostPort(domain); err == nil {
-			host = h
-		}
-		relayHost := s.cfg.RelayID
-		if h, _, err := net.SplitHostPort(s.cfg.RelayID); err == nil {
-			relayHost = h
-		}
-		if host != relayHost {
+		if !isLocalRelay(domain, s.cfg.RelayID) {
 			// Drop silently
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 	}
 
-	// Stamp the sealed.RecipientID to strip any existing @ suffix and use only the local username part
-	sealed.RecipientID = parts[0]
+	// Preserve the original RecipientID on the sealed envelope so the recipient client
+	// can verify the cryptographic commitments/AAD. We only pass the local username
+	// (parts[0]) to the router for local delivery routing.
 	sealed.FederationSenderRelay = relayID
 
-	s.router.deliver(r.Context(), sealed.RecipientID, queuedMessage{Sealed: &sealed})
+	s.router.deliver(r.Context(), parts[0], queuedMessage{Sealed: &sealed})
 	w.WriteHeader(http.StatusNoContent)
 }

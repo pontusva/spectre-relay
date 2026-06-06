@@ -250,8 +250,8 @@ func TestFederation_ReceiveEndpoint(t *testing.T) {
 	if len(drained) != 1 {
 		t.Fatalf("Expected 1 message for alice, got %d", len(drained))
 	}
-	if drained[0].Sealed.RecipientID != "alice" {
-		t.Errorf("Expected RecipientID 'alice', got %q", drained[0].Sealed.RecipientID)
+	if drained[0].Sealed.RecipientID != "alice@relay-a" {
+		t.Errorf("Expected RecipientID 'alice@relay-a', got %q", drained[0].Sealed.RecipientID)
 	}
 	if drained[0].Sealed.FederationSenderRelay != "relay-b" {
 		t.Errorf("Expected FederationSenderRelay 'relay-b', got %q", drained[0].Sealed.FederationSenderRelay)
