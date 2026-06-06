@@ -47,6 +47,7 @@ type SealedCA struct {
 // so the bytes we sign here are the bytes the client verifies over — no
 // canonicalization step, no signed-vs-parsed mismatch surface.
 type senderCert struct {
+	Iss string `json:"iss"` // issuer domain
 	UID string `json:"uid"` // authenticated relay handle of the sender
 	IK  string `json:"ik"`  // b64 32B Signal identity public key (from bundle)
 	Exp int64  `json:"exp"` // unix milliseconds; recipient rejects if now >= exp
@@ -95,8 +96,9 @@ func (ca *SealedCA) PublicKeyB64() string {
 // identity key it has independently established as belonging to that user
 // (in the relay, the identity key from the user's own registered prekey
 // bundle). Returns the exact signed bytes and the signature over them.
-func (ca *SealedCA) IssueCert(uid, identityKeyB64 string, now time.Time) (cert []byte, sig []byte, err error) {
+func (ca *SealedCA) IssueCert(uid, identityKeyB64, issuer string, now time.Time) (cert []byte, sig []byte, err error) {
 	c := senderCert{
+		Iss: issuer,
 		UID: uid,
 		IK:  identityKeyB64,
 		Exp: now.Add(defaultCertTTL).UnixMilli(),

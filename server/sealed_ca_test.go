@@ -27,7 +27,7 @@ func TestSealedCAIssueAndVerify(t *testing.T) {
 	ik := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	now := time.Unix(1_700_000_000, 0)
 
-	cert, sig, err := ca.IssueCert(uid, ik, now)
+	cert, sig, err := ca.IssueCert(uid, ik, "test.local", now)
 	if err != nil {
 		t.Fatalf("IssueCert: %v", err)
 	}

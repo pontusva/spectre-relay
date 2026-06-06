@@ -320,7 +320,7 @@ func (s *Server) buildSenderCert(userID string, now time.Time) (cert, sig []byte
 	if !found {
 		return nil, nil, false
 	}
-	cert, sig, err := s.sealedCA.IssueCert(userID, ik, now)
+	cert, sig, err := s.sealedCA.IssueCert(userID, ik, s.cfg.RelayID, now)
 	if err != nil {
 		s.log.Error("sender cert issue failed", "err_type", "sign")
 		return nil, nil, false

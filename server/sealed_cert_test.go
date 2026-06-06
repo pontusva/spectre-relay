@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"spectre-relay/config"
 )
 
 func quietLogger() *slog.Logger {
@@ -30,7 +32,7 @@ func TestBuildSenderCertBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPrekeyStore: %v", err)
 	}
-	s := &Server{prekeys: ps, sealedCA: ca, log: quietLogger()}
+	s := &Server{prekeys: ps, sealedCA: ca, log: quietLogger(), cfg: &config.Config{RelayID: "test.local"}}
 	now := time.Unix(1_700_000_000, 0)
 
 	// No registered bundle -> refuse to issue.
