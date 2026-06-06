@@ -213,7 +213,11 @@ func (s *Server) serveConn(parentCtx context.Context, c *websocket.Conn, remoteA
 		if h, _, err := net.SplitHostPort(domain); err == nil {
 			host = h
 		}
-		if host == s.cfg.RelayID {
+		relayHost := s.cfg.RelayID
+		if h, _, err := net.SplitHostPort(s.cfg.RelayID); err == nil {
+			relayHost = h
+		}
+		if host == relayHost {
 			userID = parts[0]
 		}
 	}
@@ -436,7 +440,11 @@ func (s *Server) handleFederationDeliver(w http.ResponseWriter, r *http.Request)
 		if h, _, err := net.SplitHostPort(domain); err == nil {
 			host = h
 		}
-		if host != s.cfg.RelayID {
+		relayHost := s.cfg.RelayID
+		if h, _, err := net.SplitHostPort(s.cfg.RelayID); err == nil {
+			relayHost = h
+		}
+		if host != relayHost {
 			// Drop silently
 			w.WriteHeader(http.StatusNoContent)
 			return

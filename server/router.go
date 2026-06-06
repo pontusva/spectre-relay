@@ -130,7 +130,11 @@ func (r *Router) deliver(ctx context.Context, recipientID string, m queuedMessag
 		if h, _, err := net.SplitHostPort(domain); err == nil {
 			host = h
 		}
-		if host != r.relayID {
+		relayHost := r.relayID
+		if h, _, err := net.SplitHostPort(r.relayID); err == nil {
+			relayHost = h
+		}
+		if host != relayHost {
 			// Federated recipient
 			if m.Sealed == nil {
 				// Drop silently: federated delivery is sealed sender only

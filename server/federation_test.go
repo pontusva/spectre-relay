@@ -152,6 +152,60 @@ func TestFederation_LocalNormalization(t *testing.T) {
 	}
 }
 
+func TestFederation_LocalNormalization_WithPorts(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "offline_queue.db")
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	store, err := NewStore(dbPath, 60, logger)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Stop()
+
+	// Local relay-id contains a port
+	router := NewRouter(store, 65536, 60, "relay-a:8080")
+
+	// Test 1: Deliver to recipient with a matching host and matching port
+	recipient1 := "alice@relay-a:8080"
+	sealedMsg1 := queuedMessage{
+		Sealed: &model.SealedEnvelope{
+			RecipientID: recipient1,
+			Ciphertext:  []byte("local secret 1"),
+			ID:          "msg-id-1",
+		},
+	}
+	router.deliver(context.Background(), recipient1, sealedMsg1)
+
+	// Test 2: Deliver to recipient with a matching host but no port
+	recipient2 := "bob@relay-a"
+	sealedMsg2 := queuedMessage{
+		Sealed: &model.SealedEnvelope{
+			RecipientID: recipient2,
+			Ciphertext:  []byte("local secret 2"),
+			ID:          "msg-id-2",
+		},
+	}
+	router.deliver(context.Background(), recipient2, sealedMsg2)
+
+	// Verify both were normalized to their local usernames
+	drainedAlice := store.DrainQueue("alice")
+	if len(drainedAlice) != 1 {
+		t.Fatalf("Expected 1 message enqueued for 'alice', got %d", len(drainedAlice))
+	}
+	if string(drainedAlice[0].Sealed.Ciphertext) != "local secret 1" {
+		t.Errorf("Expected 'local secret 1', got %q", string(drainedAlice[0].Sealed.Ciphertext))
+	}
+
+	drainedBob := store.DrainQueue("bob")
+	if len(drainedBob) != 1 {
+		t.Fatalf("Expected 1 message enqueued for 'bob', got %d", len(drainedBob))
+	}
+	if string(drainedBob[0].Sealed.Ciphertext) != "local secret 2" {
+		t.Errorf("Expected 'local secret 2', got %q", string(drainedBob[0].Sealed.Ciphertext))
+	}
+}
+
+
 func TestFederation_ReceiveEndpoint(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "offline_queue.db")
