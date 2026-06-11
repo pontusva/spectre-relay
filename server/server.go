@@ -28,6 +28,13 @@ type Server struct {
 	auth        *Authenticator
 	sealedCA    *SealedCA
 	certLimiter *rateLimiter
+	// prekeyLimiter bounds GET /prekeys/{id} per REQUESTED target id, not per
+	// caller (the endpoint is unauthenticated by design). It throttles the
+	// rate at which any one victim's one-time prekeys can be drained, which
+	// would otherwise silently force first contacts onto the no-OTPK,
+	// reduced-forward-secrecy X3DH path (finding R3-5). The limit is generous
+	// vs. a legitimate fetch (one per new conversation) but caps bulk drain.
+	prekeyLimiter *rateLimiter
 	log         *slog.Logger
 	hs          *http.Server
 	active      int64
@@ -38,6 +45,16 @@ type Server struct {
 // roughly once per connect — a small ceiling is plenty and bounds CA-signing
 // abuse.
 const certRequestsPerMin = 6
+
+// Max prekey-bundle fetches per TARGET user id per minute (finding R3-5).
+// A legitimate sender fetches a given peer's bundle once, when starting a
+// conversation, then establishes a session and never re-fetches. So a real
+// recipient is hit a handful of times a minute at most even in a popularity
+// spike; this ceiling lets an attacker drain at most this many one-time
+// prekeys per minute per victim instead of the whole pool in one burst,
+// turning silent forward-secrecy downgrade into a slow, bounded, and (via
+// the low-supply signal) observable condition.
+const prekeyFetchesPerMinPerTarget = 10
 
 func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	store, err := NewStore(cfg.OfflineQueuePath, cfg.MessageTTLSeconds, log)
@@ -61,6 +78,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		auth:        NewAuthenticator(log),
 		sealedCA:    sealedCA,
 		certLimiter: newRateLimiter(certRequestsPerMin),
+		prekeyLimiter: newRateLimiter(prekeyFetchesPerMinPerTarget),
 		log:         log,
 	}, nil
 }
@@ -340,9 +358,20 @@ func (s *Server) handleSealedCA(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
+	// Serve the rotation proof when present so a client that pinned the
+	// PREVIOUS key can verify this key was authorised by it (finding R3-2)
+	// rather than failing closed on the change. Empty fields on a
+	// first-generation key; the client treats absence as "no rotation".
+	prevPub, rotSig := s.sealedCA.RotationProofB64()
 	if err := json.NewEncoder(w).Encode(struct {
-		PublicKey string `json:"public_key"`
-	}{PublicKey: s.sealedCA.PublicKeyB64()}); err != nil {
+		PublicKey     string `json:"public_key"`
+		PrevPublicKey string `json:"prev_public_key,omitempty"`
+		RotationSig   string `json:"rotation_sig,omitempty"`
+	}{
+		PublicKey:     s.sealedCA.PublicKeyB64(),
+		PrevPublicKey: prevPub,
+		RotationSig:   rotSig,
+	}); err != nil {
 		s.log.Error("sealed-ca response write failed", "err_type", classifyErr(err))
 	}
 }
@@ -369,7 +398,15 @@ func (s *Server) handlePrekeysGet(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	resp, ok := s.prekeys.getBundle(userID)
+	// R3-5: throttle one-time-prekey consumption per TARGET. Over budget, we
+	// still answer, but WITHOUT consuming an OTPK — the response is the
+	// signed-prekey-only bundle, byte-shape-identical to the legitimate
+	// "OTPKs exhausted" fallback. So an unauthenticated attacker looping GETs
+	// can no longer drain the victim's pool faster than the budget, and the
+	// throttle itself is not a new oracle (it looks exactly like a popular
+	// user who has run low). Under budget, behaviour is unchanged.
+	consumeOTPK := s.prekeyLimiter.allow(userID, time.Now())
+	resp, ok := s.prekeys.getBundleWithOTPK(userID, consumeOTPK)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return

@@ -34,12 +34,35 @@ import (
 // already fingerprint-verified session. The ONLY defense against this
 // forgery is out-of-band safety-number verification on the client — the cert
 // is metadata-hiding + honest-relay integrity, NOT sender authentication.
-// Store this key in an HSM / sealed store in production and document a
-// rotation-with-overlap + pin-change-alert flow (TOFU re-pin alone lets a
-// relay serve a fresh CA pub to an unpinned client and forge freely).
+// Store this key in an HSM / sealed store in production.
+//
+// ROTATION (finding R3-2): a client that has pinned this key fails closed if
+// /sealed-ca later serves a DIFFERENT key (SealedCaException → sealed sender
+// UNAVAILABLE). That is correct against a silent swap, but it also means a
+// naive rotation bricks every existing client, AND a malicious relay could
+// rotate as a deniable network-wide kill switch. The mitigation is a SIGNED
+// rotation: when the operator rotates, the relay signs the NEW public key
+// with the OLD private key and serves that proof at /sealed-ca. A pinned
+// client accepts the new key ONLY if the proof verifies under the key it
+// already trusts — so the relay cannot introduce a new CA the client honours
+// without possession of the old private key, and an honest operator can
+// rotate without bricking anyone. To rotate: move the current key file to
+// <path>.prev and restart; NewSealedCA mints a fresh key and a rotation
+// proof. (For the strongest posture, clients should ALSO be able to pin the
+// CA key out-of-band via build config so the relay is never its own pinned
+// authority on first run — see SealedCaService.)
 type SealedCA struct {
 	priv ed25519.PrivateKey
 	pub  ed25519.PublicKey
+
+	// prevPub is the immediately-previous CA public key, if this key was
+	// minted as a rotation (i.e. a <path>.prev file existed at load). nil
+	// when this is a first-generation key.
+	prevPub ed25519.PublicKey
+	// rotationSig is Ed25519(prevPriv, pub): a proof, verifiable by anyone
+	// holding prevPub, that the holder of the OLD private key authorised
+	// THIS new public key. Empty when prevPub is nil.
+	rotationSig []byte
 }
 
 // senderCert is the exact JSON structure that gets signed. Go's
@@ -61,13 +84,29 @@ const defaultCertTTL = 24 * time.Hour
 // NewSealedCA loads the Ed25519 signing key from `path`, generating and
 // persisting one on first run. File is the 64-byte ed25519 private key,
 // mode 0600 — same custody posture as the AES key files.
+//
+// ROTATION: if `path` does not exist but `<path>.prev` does, NewSealedCA
+// mints a fresh key AND a rotation proof — Ed25519(prevPriv, newPub) — so
+// already-pinned clients can verify the new key was authorised by the old
+// one (finding R3-2). The .prev file is left in place (read-only to this
+// process after load); operators may remove it once all clients have
+// migrated. A standalone .prev with no main key is treated as the rotation
+// trigger exactly once: the new key is written to `path`.
 func NewSealedCA(path string) (*SealedCA, error) {
 	if data, err := os.ReadFile(path); err == nil {
 		if len(data) != ed25519.PrivateKeySize {
 			return nil, errors.New("invalid sealed-ca key length")
 		}
 		priv := ed25519.PrivateKey(data)
-		return &SealedCA{priv: priv, pub: priv.Public().(ed25519.PublicKey)}, nil
+		ca := &SealedCA{priv: priv, pub: priv.Public().(ed25519.PublicKey)}
+		// If a .prev exists alongside an established key, reconstruct the
+		// rotation proof so /sealed-ca can keep serving it across restarts
+		// (the proof is deterministic for a given old priv + new pub).
+		if prevPriv, ok := readPrevKey(path); ok {
+			ca.prevPub = prevPriv.Public().(ed25519.PublicKey)
+			ca.rotationSig = ed25519.Sign(prevPriv, ca.pub)
+		}
+		return ca, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -82,13 +121,45 @@ func NewSealedCA(path string) (*SealedCA, error) {
 	if err := os.WriteFile(path, priv, 0o600); err != nil {
 		return nil, err
 	}
-	return &SealedCA{priv: priv, pub: pub}, nil
+	ca := &SealedCA{priv: priv, pub: pub}
+	// First-run-after-rotation: a .prev key file signals "this fresh key
+	// replaces the old one" — sign the new pub with the old priv so pinned
+	// clients can follow the rotation instead of failing closed.
+	if prevPriv, ok := readPrevKey(path); ok {
+		ca.prevPub = prevPriv.Public().(ed25519.PublicKey)
+		ca.rotationSig = ed25519.Sign(prevPriv, ca.pub)
+	}
+	return ca, nil
+}
+
+// readPrevKey loads <path>.prev as a raw ed25519 private key if present and
+// well-formed. Returns ok=false (and no error) when absent or malformed — a
+// broken .prev must not block startup, it just means no rotation proof is
+// served and pinned clients will fail closed on the change (the safe default).
+func readPrevKey(path string) (ed25519.PrivateKey, bool) {
+	data, err := os.ReadFile(path + ".prev")
+	if err != nil || len(data) != ed25519.PrivateKeySize {
+		return nil, false
+	}
+	return ed25519.PrivateKey(data), true
 }
 
 // PublicKeyB64 returns the standard-base64 raw 32-byte public key, served
 // to clients at /sealed-ca for pinning.
 func (ca *SealedCA) PublicKeyB64() string {
 	return base64.StdEncoding.EncodeToString(ca.pub)
+}
+
+// RotationProofB64 returns the previous public key and the rotation
+// signature (both standard-base64), or empty strings when this CA key was
+// not minted as a rotation. Served at /sealed-ca so a pinned client can
+// verify Ed25519(prevPub, sig over newPub) before adopting the new key.
+func (ca *SealedCA) RotationProofB64() (prevPub, sig string) {
+	if ca.prevPub == nil || len(ca.rotationSig) == 0 {
+		return "", ""
+	}
+	return base64.StdEncoding.EncodeToString(ca.prevPub),
+		base64.StdEncoding.EncodeToString(ca.rotationSig)
 }
 
 // IssueCert builds and signs a sender certificate binding `uid` to its

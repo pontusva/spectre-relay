@@ -154,6 +154,17 @@ func (ps *PrekeyStore) registerBundle(userID string, bundle PrekeyBundle) error 
 // never both receive the same OTPK — that would break the single-use
 // invariant the X3DH handshake relies on for forward secrecy.
 func (ps *PrekeyStore) getBundle(userID string) (*PrekeyResponse, bool) {
+	return ps.getBundleWithOTPK(userID, true)
+}
+
+// getBundleWithOTPK is getBundle with explicit control over whether a
+// one-time prekey is consumed. consumeOTPK=false serves the static bundle
+// (identity + signed prekey) WITHOUT popping an OTPK — the same shape as the
+// OTPK-exhausted fallback. The rate-limited public endpoint uses this to
+// cap one-time-prekey drain per target without becoming a presence oracle
+// (finding R3-5). consumeOTPK=true is the normal path and is identical to
+// the historical getBundle behaviour.
+func (ps *PrekeyStore) getBundleWithOTPK(userID string, consumeOTPK bool) (*PrekeyResponse, bool) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	b, ok := ps.bundles[userID]
@@ -166,7 +177,7 @@ func (ps *PrekeyStore) getBundle(userID string) (*PrekeyResponse, bool) {
 		SignedPrekeySig: b.SignedPrekeySig,
 		SignedPrekeyID:  b.SignedPrekeyID,
 	}
-	if len(b.OneTimePrekeys) > 0 {
+	if consumeOTPK && len(b.OneTimePrekeys) > 0 {
 		// Pop head; bundle is now mutated, persist immediately so a
 		// crash cannot resurrect a consumed OTPK on restart.
 		consumed := b.OneTimePrekeys[0]
